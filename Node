@@ -1,0 +1,267 @@
+const axios = require('axios');
+const crypto = require('crypto');
+const querystring = require('querystring');
+const dotenv = require('dotenv').config();
+
+class OneRoster {
+    // Endpoints to pull data from
+    static ENDPOINTS = [
+        "/academicSessions",
+        "/orgs",
+        "/courses",
+        "/classes",
+        "/users",
+        "/enrollments",
+        "/demographics"
+    ];
+
+    // Page size for API requests
+    static PAGE_SIZE = 10000;
+
+    constructor() {
+        // Initialize the OneRoster client with client ID and secret
+        this._client_id = process.env.CLIENT_ID;
+        this._client_secret = process.env.CLIENT_SECRET;
+        // Base URL for all API requests
+        this.base_url = process.env.BASE_URL;
+    }
+
+    async makeRosterRequest(endpoint, limit = OneRoster.PAGE_SIZE, offset = 0) {
+        /**
+         * Make a request to the specified endpoint with pagination parameters.
+         *
+         * @param {string} endpoint - The API endpoint to request data from
+         * @param {number} limit - Number of records per page
+         * @param {number} offset - Offset for pagination
+         * @return {Promise<Object>} A dictionary containing the status code, response data, and headers
+         */
+        // Construct the URL with pagination parameters
+        const url = `${this.base_url}${endpoint}?limit=${limit}&offset=${offset}`;
+
+        // Generate timestamp and nonce for OAuth
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const nonce = this._generateNonce(10);
+
+        // OAuth parameters
+        const oauthParams = {
+            'oauth_consumer_key': this._client_id,
+            'oauth_signature_method': 'HMAC-SHA256',
+            'oauth_timestamp': timestamp,
+            'oauth_nonce': nonce
+        };
+
+        // Split URL into base URL and parameters
+        const [baseUrl, urlParams] = this._splitUrl(url);
+        // Merge OAuth parameters with URL parameters
+        const allParams = { ...oauthParams, ...urlParams };
+
+        // Create the base string for the OAuth signature
+        const baseString = this._buildBaseString(baseUrl, 'GET', allParams);
+
+        // Create the composite key for HMAC
+        const compositeKey = `${querystring.escape(this._client_secret)}&`;
+        // Generate the OAuth signature
+        const authSignature = this._generateAuthSignature(baseString, compositeKey);
+        oauthParams["oauth_signature"] = authSignature;
+
+        // Build the OAuth authorization header
+        const authHeader = this._buildAuthHeader(oauthParams);
+
+        // Make the GET request to the API
+        return this._makeGetRequest(baseUrl, authHeader, urlParams);
+    }
+
+    async pullCompleteDataSet() {
+        /**
+         * Pull the complete data set from all defined endpoints.
+         *
+         * @return {Promise<Object>} A dictionary containing data from all endpoints
+         */
+        const allData = {};
+        // Loop through each endpoint to pull all data
+        for (const endpoint of OneRoster.ENDPOINTS) {
+            allData[endpoint] = await this._pullAllData(endpoint);
+        }
+        return allData;
+    }
+
+    async _pullAllData(endpoint) {
+        /**
+         * Pull all data from a specified endpoint using pagination.
+         *
+         * @param {string} endpoint - The API endpoint to pull data from
+         * @return {Promise<Array>} A list of all records from the endpoint
+         */
+        const data = [];
+        let offset = 0;
+        let totalCount = null;
+
+        while (true) {
+            // Make the API request with retries
+            const response = await this._makeRequestWithRetries(endpoint, OneRoster.PAGE_SIZE, offset);
+            if (response.status_code !== 200) {
+                console.error(`Error in request to endpoint ${endpoint} - ${response.status_code}`);
+                break;
+            }
+
+            // Get the current page of data
+            const responseName = endpoint.replace("/", "");
+            const currentData = response.response[responseName];
+            data.push(...currentData);
+
+            // Set totalCount on the first request
+            if (totalCount === null) {
+                totalCount = parseInt(response.headers['x-total-count'], 10) || currentData.length;
+            }
+
+            // Update the offset for the next page
+            offset += OneRoster.PAGE_SIZE;
+
+            // Break the loop if all data is fetched
+            if (data.length >= totalCount) break;
+        }
+
+        return data;
+    }
+
+    async _makeRequestWithRetries(endpoint, limit = OneRoster.PAGE_SIZE, offset = 0) {
+        /**
+         * Make a request with retries in case of rate limiting or server errors.
+         *
+         * @param {string} endpoint - The API endpoint to request data from
+         * @param {number} limit - Number of records per page
+         * @param {number} offset - Offset for pagination
+         * @return {Promise<Object>} A dictionary containing the status code, response data, and headers
+         */
+        let retries = 0;
+        const maxRetries = 3;
+        const baseWaitTime = 1;
+
+        while (retries < maxRetries) {
+            const response = await this.makeRosterRequest(endpoint, limit, offset);
+            if (response.status_code === 200) {
+                return response;
+            } else if ([429, 502].includes(response.status_code)) {
+                // Apply exponential backoff with jitter
+                const waitTime = baseWaitTime * (2 ** retries) + Math.random();
+                await this._sleep(waitTime * 1000);
+                retries += 1;
+            } else {
+                return response;
+            }
+        }
+
+        return { status_code: 500, response: "Max retries exceeded" };
+    }
+
+    _generateNonce(length) {
+        /**
+         * Generate a random nonce.
+         *
+         * @param {number} length - Length of the nonce
+         * @return {string} The generated nonce
+         */
+        const characters = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        let result = "";
+        for (let i = 0; i < length; i++) {
+            result += characters.charAt(Math.floor(Math.random() * characters.length));
+        }
+        return result;
+    }
+
+    _splitUrl(url) {
+        /**
+         * Split the URL into base URL and parameters.
+         *
+         * @param {string} url - The URL to split
+         * @return {Array} The base URL and parameters dictionary
+         */
+        const [baseUrl, queryString] = url.split('?');
+        const urlParams = queryString ? Object.fromEntries(new URLSearchParams(queryString)) : {};
+        return [baseUrl, urlParams];
+    }
+
+    _buildBaseString(baseUrl, method, params) {
+        /**
+         * Generate the base string for OAuth signature generation.
+         *
+         * @param {string} baseUrl - The base URL
+         * @param {string} method - The HTTP method
+         * @param {Object} params - The URL and OAuth parameters
+         * @return {string} The base string for OAuth signature generation
+         */
+        const encodedParams = Object.keys(params)
+            .sort()
+            .map(key => `${key}=${querystring.escape(params[key])}`)
+            .join('&');
+        return `${method}&${querystring.escape(baseUrl)}&${querystring.escape(encodedParams)}`;
+    }
+
+    _generateAuthSignature(baseString, compositeKey) {
+        /**
+         * Generate the OAuth signature.
+         *
+         * @param {string} baseString - The base string for the OAuth signature
+         * @param {string} compositeKey - The composite key for HMAC
+         * @return {string} The generated OAuth signature
+         */
+        const hmacSha256 = crypto.createHmac('sha256', compositeKey);
+        hmacSha256.update(baseString);
+        return hmacSha256.digest('base64');
+    }
+
+    _buildAuthHeader(oauthParams) {
+        /**
+         * Generate the OAuth authorization header.
+         *
+         * @param {Object} oauthParams - OAuth parameters
+         * @return {string} The OAuth authorization header
+         */
+        const headerParams = Object.keys(oauthParams)
+            .map(key => `${key}="${querystring.escape(oauthParams[key])}"`)
+            .join(', ');
+        return `OAuth ${headerParams}`;
+    }
+
+    async _makeGetRequest(url, authHeader, params) {
+        /**
+         * Make a GET request to the API.
+         *
+         * @param {string} url - The base URL of the request
+         * @param {string} authHeader - The OAuth authorization header
+         * @param {Object} params - URL parameters
+         * @return {Promise<Object>} A dictionary containing the status code, response data, and headers
+         */
+        try {
+            const response = await axios.get(url, {
+                headers: { "Authorization": authHeader },
+                params: params
+            });
+            return {
+                status_code: response.status,
+                response: response.data,
+                headers: response.headers
+            };
+        } catch (error) {
+            console.error("Request failed:", error.message);
+            return { status_code: 500, response: `An error occurred: ${error.message}` };
+        }
+    }
+
+    _sleep(ms) {
+        /**
+         * Sleep for the specified number of milliseconds.
+         *
+         * @param {number} ms - Number of milliseconds to sleep
+         * @return {Promise} A promise that resolves after the specified time
+         */
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+}
+
+// If running as a script, pull the complete data set and log it
+(async () => {
+    const roster = new OneRoster();
+    const data = await roster.pullCompleteDataSet();
+    console.log(JSON.stringify(data, null, 2));
+})();
